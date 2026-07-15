@@ -12,7 +12,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 Pod::Spec.new do |s|
   s.name           = 'WatchtowerCore'
-  s.version        = '0.1.0'
+  s.version        = '0.1.1'
   s.summary        = 'Watchtower native iOS tap-capture engine (bridge-free Swift).'
   s.description    = <<-DESC
     Captures taps, screen views, rage/dead taps and redacted screen templates

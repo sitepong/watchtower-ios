@@ -14,6 +14,11 @@ public struct CaptureEvent: Codable {
     public var distinct_id: String?
     public var device_model: String?
     public var os_version: String?
+    /// Release channel / environment this event was captured in (dev | preview |
+    /// production | …). Stamped on every event so the dashboard can keep dev
+    /// noise out of prod analytics. Defaults to "production"; the engine sets it
+    /// from the resolved channel. Non-optional so it is always on the wire.
+    public var channel: String = "production"
     /// Persistent per-install id (identifierForVendor) — stamped on every event
     /// so the dashboard can stitch consecutive sessions from the same install
     /// into a journey at read time, even for anonymous users.

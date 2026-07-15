@@ -37,6 +37,13 @@ final class WatchtowerEngine {
     /// overrides to "react-native-ios" via start(platform:).
     private var platform: String = "ios"
 
+    /// Release channel / environment stamped on every event (dev | preview |
+    /// production | …). Resolved by Watchtower.start (debug→"development",
+    /// release→"production", or an explicit override) and passed in here. The
+    /// suppression decision (don't run at all on an ignored channel) is made in
+    /// Watchtower.start before this engine is ever started.
+    private var channel: String = "production"
+
     /// Persistent per-install id (identifierForVendor), resolved once at start
     /// and stamped on every event so the dashboard can stitch consecutive
     /// sessions from the same install into a journey at read time.
@@ -83,13 +90,15 @@ final class WatchtowerEngine {
     // MARK: - Lifecycle
 
     func start(apiKey: String, projectId: String, endpoint: URL, sampleRate: Double,
-               platform: String = "ios", sessionGraceMs: Double = 30_000) {
+               platform: String = "ios", sessionGraceMs: Double = 30_000,
+               channel: String = "production") {
         guard !isRunning else { return }
         self.transport = Transport(apiKey: apiKey, projectId: projectId, endpoint: endpoint)
         self.sessionId = UUID().uuidString
         self.sequence = 0
         self.sampleRate = sampleRate
         self.platform = platform
+        self.channel = channel
         self.sessionGraceMs = sessionGraceMs
         self.installId = UIDevice.current.identifierForVendor?.uuidString
         self.lastBackgroundedAt = nil
@@ -149,6 +158,9 @@ final class WatchtowerEngine {
 
     var currentSessionId: String? { isRunning ? sessionId : nil }
 
+    /// The channel events are being tagged with, or nil when not running.
+    var currentChannel: String? { isRunning ? channel : nil }
+
     private func durationMs() -> UInt64 {
         guard let started = sessionStartedAt else { return 0 }
         return UInt64(max(0, Date().timeIntervalSince(started) * 1000))
@@ -166,6 +178,7 @@ final class WatchtowerEngine {
             os_version: osVersion
         )
         event.install_id = installId
+        event.channel = channel
         // Link hints ride only the session_start of a rolled session.
         if type == "session_start" {
             event.previous_session_id = pendingPreviousSessionId

@@ -11,22 +11,67 @@ public enum Watchtower {
     /// §1.1). It defaults to `"ios"` for native hosts; the React Native bridge
     /// (§4) passes `"react-native-ios"`. This is the only host-overridable
     /// identity knob — capture logic is identical regardless of platform.
+    ///
+    /// `channel` tags every event with a release channel / environment so dev
+    /// traffic can be kept out of prod analytics. When omitted it is resolved
+    /// automatically: **debug builds → `"development"`, release builds →
+    /// `"production"`**. Any channel listed in `ignoreChannels` is *suppressed*
+    /// — `start` becomes a complete no-op (no swizzles, no observers, zero
+    /// network). The default `["development"]` means debug builds capture
+    /// nothing unless you opt in (pass `ignoreChannels: []` or an explicit
+    /// `channel`). Release builds send `"production"` and are never suppressed
+    /// by the default.
     public static func start(apiKey: String, projectId: String,
                              endpoint: URL, sampleRate: Double = 0.1,
-                             platform: String = "ios", sessionGraceMs: Double = 30_000) {
+                             platform: String = "ios", sessionGraceMs: Double = 30_000,
+                             channel: String? = nil,
+                             ignoreChannels: [String] = ["development"]) {
+        let resolved = resolveChannel(channel)
+        // Suppressed channel → don't start at all. This is the "ignore dev,
+        // listen to prod" gate: zero capture and zero ingest cost for dev.
+        let ignored = Set(ignoreChannels.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        if ignored.contains(resolved) { return }
+
         #if canImport(UIKit)
         // Ensure UIKit work happens on the main thread.
         if Thread.isMainThread {
             WatchtowerEngine.shared.start(apiKey: apiKey, projectId: projectId,
                                           endpoint: endpoint, sampleRate: sampleRate,
-                                          platform: platform, sessionGraceMs: sessionGraceMs)
+                                          platform: platform, sessionGraceMs: sessionGraceMs,
+                                          channel: resolved)
         } else {
             DispatchQueue.main.async {
                 WatchtowerEngine.shared.start(apiKey: apiKey, projectId: projectId,
                                               endpoint: endpoint, sampleRate: sampleRate,
-                                              platform: platform, sessionGraceMs: sessionGraceMs)
+                                              platform: platform, sessionGraceMs: sessionGraceMs,
+                                              channel: resolved)
             }
         }
+        #endif
+    }
+
+    /// Resolve the effective channel: an explicit, non-empty override wins
+    /// (lowercased); otherwise debug builds are `"development"` and release
+    /// builds `"production"`. Exposed at module scope so tests can assert the
+    /// build-config default without a running engine.
+    static func resolveChannel(_ explicit: String?) -> String {
+        if let c = explicit?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !c.isEmpty {
+            return c
+        }
+        #if DEBUG
+        return "development"
+        #else
+        return "production"
+        #endif
+    }
+
+    /// The channel the engine is currently tagging events with, or nil when not
+    /// running (e.g. suppressed). Useful for diagnostics and tests.
+    public static var channel: String? {
+        #if canImport(UIKit)
+        return WatchtowerEngine.shared.currentChannel
+        #else
+        return nil
         #endif
     }
 
