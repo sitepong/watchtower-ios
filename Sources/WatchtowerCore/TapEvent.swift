@@ -56,6 +56,19 @@ public struct CaptureEvent: Codable {
     /// Client-side heuristic (§1.1): tap produced no observable response.
     /// nil when false or undetermined — never sent as false.
     public var dead: Bool?
+
+    // track — semantic breadcrumbs emitted by the host app (Watchtower.track).
+    //
+    // A tap tells you *where* someone touched; it cannot tell you *what* they
+    // acted on. `properties` carries that: the product id behind a card, the
+    // screen a transition came from, the cart value at checkout. Stored as a
+    // JSON object string rather than a typed dictionary so the wire format and
+    // the ClickHouse column stay schema-stable as hosts add keys — ingest
+    // persists it verbatim and queries it with JSONExtract*.
+    //
+    // Only populated on `type == "track"`. Nil everywhere else, so no existing
+    // event grows on the wire.
+    public var properties: String?
 }
 
 struct TapsBatch: Codable {

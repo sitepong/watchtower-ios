@@ -89,6 +89,88 @@ public enum Watchtower {
         #endif
     }
 
+    /// Record a semantic breadcrumb: what the user actually did, not just where
+    /// they touched.
+    ///
+    /// Tap capture is anonymous by construction — hit-testing yields a view, so
+    /// it can tell you a product card was tapped but never *which* product. Call
+    /// this at the point where that meaning is in scope:
+    ///
+    /// ```swift
+    /// Watchtower.track("product_opened", props: [
+    ///     "item_id": product.id,
+    ///     "source_screen": "home.for_you",
+    ///     "price": String(product.price)
+    /// ])
+    /// ```
+    ///
+    /// The current screen is stamped automatically. Values are strings so the
+    /// wire format cannot vary by host; ingest stores the JSON verbatim and
+    /// queries it with JSONExtract*. No-op if `start` was never called or the
+    /// channel is suppressed, so leaving these calls in a debug build is free.
+    public static func track(_ name: String, props: [String: String] = [:]) {
+        #if canImport(UIKit)
+        if Thread.isMainThread {
+            WatchtowerEngine.shared.track(name, props: props)
+        } else {
+            DispatchQueue.main.async { WatchtowerEngine.shared.track(name, props: props) }
+        }
+        #endif
+    }
+
+    /// Attach sticky context that rides **every subsequent event**.
+    ///
+    /// Where `track` records what happened, context records the conditions it
+    /// happened under — so you can segment after the fact without a join:
+    ///
+    /// ```swift
+    /// Watchtower.setContext("shipping_cost", "25.00")
+    /// Watchtower.setContext("cart_value", "180.00")
+    /// Watchtower.setContext("flag.free_shipping", "off")
+    /// Watchtower.setContext("user_tier", "new")
+    /// ```
+    ///
+    /// Every tap, screen view and breadcrumb from that point carries those
+    /// keys, which is what lets you ask "do people abandon checkout more when
+    /// shipping is $25+?" or "does the free-shipping flag change exit rate?" —
+    /// the condition is on the abandon event itself.
+    ///
+    /// Pass `nil` to clear a single key. Bounded to 32 keys / 256 chars each,
+    /// because this rides the whole event stream.
+    public static func setContext(_ key: String, _ value: String?) {
+        #if canImport(UIKit)
+        if Thread.isMainThread { WatchtowerEngine.shared.setContext(key, value) }
+        else { DispatchQueue.main.async { WatchtowerEngine.shared.setContext(key, value) } }
+        #endif
+    }
+
+    /// Bulk context update — useful for stamping a whole feature-flag set at
+    /// launch. Keys not mentioned are left untouched.
+    public static func setContext(_ values: [String: String]) {
+        #if canImport(UIKit)
+        if Thread.isMainThread { WatchtowerEngine.shared.setContext(values) }
+        else { DispatchQueue.main.async { WatchtowerEngine.shared.setContext(values) } }
+        #endif
+    }
+
+    /// Drop all sticky context — call on sign-out so one user's conditions
+    /// never bleed into the next session.
+    public static func clearContext() {
+        #if canImport(UIKit)
+        if Thread.isMainThread { WatchtowerEngine.shared.clearContext() }
+        else { DispatchQueue.main.async { WatchtowerEngine.shared.clearContext() } }
+        #endif
+    }
+
+    /// The context currently stamped on outgoing events.
+    public static var context: [String: String] {
+        #if canImport(UIKit)
+        return WatchtowerEngine.shared.currentContext
+        #else
+        return [:]
+        #endif
+    }
+
     /// Force a one-shot capture of the current screen (gated on dedup).
     public static func captureScreenshot() {
         #if canImport(UIKit)

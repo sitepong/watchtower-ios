@@ -60,6 +60,22 @@ final class WatchtowerEngine {
     private var pendingPreviousSessionId: String?
     private var pendingSessionGapMs: UInt64?
 
+    /// Sticky breadcrumb context: key/value metadata stamped onto EVERY
+    /// subsequent event until changed or cleared.
+    ///
+    /// This is what makes segmentation possible. A per-event property tells you
+    /// what happened once; context tells you the conditions it happened under —
+    /// the shipping quote, the cart value, which feature flags were live, the
+    /// user's tier. With it you can ask "do people abandon checkout more when
+    /// shipping is $25+?" or "does the free-shipping flag change exit rate?",
+    /// because the condition is present on the abandon event itself rather than
+    /// needing a join against some other table.
+    ///
+    /// Deliberately small and flat (String→String): it rides every event, so
+    /// cost is paid on the whole stream. Callers set a handful of keys, not a
+    /// blob.
+    private var context: [String: String] = [:]
+
     /// Explicit screen identity override via setScreen (§3.2). Cleared/overridden
     /// by viewDidAppear unless re-set.
     private var explicitScreenName: String?
@@ -179,6 +195,10 @@ final class WatchtowerEngine {
         )
         event.install_id = installId
         event.channel = channel
+        // Sticky context rides every event so any of them can be segmented by
+        // the conditions in force at the time (shipping cost, cart value, live
+        // feature flags). Per-event props are merged over this in track().
+        if !context.isEmpty { event.properties = Self.encode(context) }
         // Link hints ride only the session_start of a rolled session.
         if type == "session_start" {
             event.previous_session_id = pendingPreviousSessionId
@@ -195,6 +215,66 @@ final class WatchtowerEngine {
     private func emit(_ event: CaptureEvent) {
         debugOnEmit?(event)
         transport?.enqueue(event)
+    }
+
+    /// Set (or clear, with nil) one sticky context key. Stamped onto every
+    /// subsequent event until changed.
+    func setContext(_ key: String, _ value: String?) {
+        let k = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !k.isEmpty else { return }
+        if let v = value, !v.isEmpty {
+            // Bounded so a runaway caller can't inflate every event on the
+            // stream; context is meant to be a handful of segmentation keys.
+            guard context.count < 32 || context[k] != nil else { return }
+            context[k] = String(v.prefix(256))
+        } else {
+            context.removeValue(forKey: k)
+        }
+    }
+
+    /// Bulk update. Keys present in `values` are replaced; others are untouched.
+    func setContext(_ values: [String: String]) {
+        for (k, v) in values { setContext(k, v) }
+    }
+
+    /// Drop all sticky context (e.g. on sign-out).
+    func clearContext() { context.removeAll() }
+
+    /// The context currently stamped on outgoing events (diagnostics/tests).
+    var currentContext: [String: String] { context }
+
+    private static func encode(_ dict: [String: String]) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else { return nil }
+        return json
+    }
+
+    /// Semantic breadcrumb from the host app (§1.1 `type: "track"`).
+    ///
+    /// Taps are anonymous by construction — a hit-test yields a view, not a
+    /// meaning. This is the seam where the app says what actually happened:
+    /// which product was opened, which segment a checkout came from, what the
+    /// cart was worth. The current screen is stamped automatically so a
+    /// breadcrumb is always attributable without the caller repeating itself.
+    ///
+    /// `props` is serialised to a JSON object string. Values are stringified by
+    /// the caller (the dictionary is [String: String]) so the wire format can
+    /// never vary by host — ingest stores the string verbatim.
+    func track(_ name: String, props: [String: String]) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isRunning, !trimmed.isEmpty else { return }
+
+        var event = baseEvent(type: "track")
+        event.element_label = trimmed          // the breadcrumb's name
+        // Same precedence as resolveScreenName minus the SwiftUI region lookup,
+        // which needs a window we don't have on this (non-touch) path.
+        event.screen_name = explicitScreenName ?? lastUIKitScreenName
+
+        // Merge: sticky context first, this call's props win on collision.
+        var merged = context
+        merged.merge(props) { _, new in new }
+        if !merged.isEmpty { event.properties = Self.encode(merged) }
+        emit(event)
     }
 
     private static func hardwareModel() -> String? {
@@ -488,10 +568,20 @@ final class WatchtowerEngine {
         if let al = view?.accessibilityLabel, !al.isEmpty {
             return Resolved(id: al, label: label, role: role)
         }
+
+        // NOTE: there is deliberately no accessibility-tree fallback here.
+        // SwiftUI publishes its semantics as UIAccessibilityElements, but UIKit
+        // only materialises that tree when an assistive client (VoiceOver) is
+        // active — verified empirically: 0/10 taps resolved a label this way.
+        // SwiftUI hosts must therefore declare interactive elements explicitly
+        // with `.watchtowerTag(_:)`, exactly as they declare screens with
+        // `.watchtowerScreen(_:)`.
         let cls = view.map { String(describing: type(of: $0)) } ?? "UnknownView"
         let tagNum = view?.tag ?? 0
         return Resolved(id: "\(cls)@\(tagNum)", label: label, role: role)
     }
+
+
 
     private func deepestInteractive(from view: UIView?) -> UIView? {
         var v = view
