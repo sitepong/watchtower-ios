@@ -137,14 +137,19 @@ final class WatchtowerEngine {
         Swizzling.installIfNeeded()
         observeBackground()
         isRunning = true
-        // Start the native structural-capture adapter so every session produces an
-        // rrweb-style structural mutation stream for full replay — not just the
-        // template player. It shares this session id and follows rolls via the
-        // announcement below; internally guarded, so a repeat start is a no-op.
-        SitePongStructuralCapture.shared.start(
-            endpoint: endpoint.absoluteString, apiKey: apiKey,
-            projectId: projectId, sessionId: sessionId, platform: platform
-        )
+        // Structural (view-tree) capture only yields a useful replay for React
+        // Native: RN renders into inspectable native views, so the mutation
+        // stream reconstructs the real UI. Native SwiftUI/UIKit apps collapse to
+        // opaque host views (e.g. _UIHostingView) and produce a blank, useless
+        // stream — several thousand no-content mutations per session. So skip it
+        // off-RN and rely on the screenshot template player instead. The adapter
+        // is internally guarded, so a repeat start is a no-op.
+        if platform.hasPrefix("react-native") {
+            SitePongStructuralCapture.shared.start(
+                endpoint: endpoint.absoluteString, apiKey: apiKey,
+                projectId: projectId, sessionId: sessionId, platform: platform
+            )
+        }
         emit(baseEvent(type: "session_start"))
         // Announce the session so the structural recorder can share this id and
         // roll in lockstep (the native analogue of the RN provider adopting the
