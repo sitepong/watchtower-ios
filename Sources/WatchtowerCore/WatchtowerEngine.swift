@@ -27,6 +27,15 @@ final class WatchtowerEngine {
     /// sampled session uploads a frame after every screen capture and stamps
     /// frame_hash on its taps.
     private var isSampledSession = false
+    /// Whether THIS session uploads per-session frames (and stamps frame_hash on
+    /// its taps). For React Native the structural mutation stream reconstructs a
+    /// 1-to-1 replay, so per-session frames are only the sampled drill-down and
+    /// this tracks `isSampledSession`. For native (SwiftUI/UIKit) apps structural
+    /// capture is disabled (it reconstructs blank), so per-session frames ARE the
+    /// replay — every native session must upload them, not just the sampled 10%,
+    /// or the dashboard falls back to the cross-session canonical template and
+    /// the replay shows screens that aren't from this session.
+    private var captureSessionFrames = false
     private var lastFrameHash: String?
     /// The last screen_view we emitted — dedup guard + prev_screen_name source.
     private var lastEmittedScreenName: String?
@@ -130,6 +139,10 @@ final class WatchtowerEngine {
         self.osVersion = UIDevice.current.systemVersion
         self.sessionStartedAt = Date()
         self.isSampledSession = Double.random(in: 0..<1) < sampleRate
+        // Native apps have no structural replay, so per-session frames are the
+        // only source of a 1-to-1 replay — capture them for EVERY native
+        // session. RN keeps the sampled drill-down (structural covers replay).
+        self.captureSessionFrames = self.isSampledSession || !platform.hasPrefix("react-native")
         self.lastFrameHash = nil
         self.lastEmittedScreenName = nil
         self.navCounter = 0
@@ -355,6 +368,7 @@ final class WatchtowerEngine {
         sequence = 0
         sessionStartedAt = Date()
         isSampledSession = Double.random(in: 0..<1) < sampleRate
+        captureSessionFrames = isSampledSession || !platform.hasPrefix("react-native")
         uploadedScreenFps.removeAll()
         inFlightScreenFps.removeAll()
         fpCache.removeAll()
@@ -489,7 +503,7 @@ final class WatchtowerEngine {
         event.y = ny
         event.viewport_w = UInt(bounds.width)
         event.viewport_h = UInt(bounds.height)
-        event.frame_hash = isSampledSession ? lastFrameHash : nil
+        event.frame_hash = captureSessionFrames ? lastFrameHash : nil
         stageForDeadCheck(event, screenName: screenName)
     }
 
@@ -720,9 +734,11 @@ final class WatchtowerEngine {
                 self.fpCache[screenName] = pHash
                 self.lastCaptureAt[screenName] = CACurrentMediaTime()
 
-                // Layer-3 sampled session (§1.4): every successful capture also
-                // uploads a session-scoped frame; taps carry its hash.
-                if self.isSampledSession, self.lastFrameHash != pHash, let png = png {
+                // Frame-capturing session (§1.4): every successful capture also
+                // uploads a session-scoped frame; taps carry its hash. Native
+                // sessions always capture (frames ARE their replay); RN only
+                // when sampled. Deduped on pHash → one frame per screen state.
+                if self.captureSessionFrames, self.lastFrameHash != pHash, let png = png {
                     self.lastFrameHash = pHash
                     self.transport?.postFrame(
                         sessionId: self.sessionId,
