@@ -58,6 +58,23 @@ public final class SitePongStructuralCapture {
     private var flushedEventCount = 0
     private var sending = false
 
+    // Change detection: hash of the last serialized tree. A snapshot is appended
+    // only when the tree actually changed — an idle screen buffers nothing and
+    // the sampler backs off (see scheduleSample), so a static app costs ~0.
+    // 0 doubles as the "force a keyframe" sentinel after any event drop.
+    private var lastTreeHash: UInt64 = 0
+    private var walkHash: UInt64 = 0
+    private var idleTicks = 0
+
+    // Runaway guards. The server tolerates seq_start gaps (it appends whatever
+    // arrives), so when we must drop events we advance the cursor past them and
+    // force a fresh full snapshot — the replay resumes coherently with a bounded
+    // gap instead of the uplink growing without limit.
+    private let maxPendingEvents = 600
+    private let maxBodyBytes = 2 * 1024 * 1024
+    private var failStreak = 0
+    private var flushBackoffUntil: Date?
+
     // Scroll fidelity: last seen content offset per node id; while any scroll view
     // moves we sample faster so the frame-delta capture isn't aliased.
     private var scrollOffsets: [Int: CGPoint] = [:]
@@ -138,13 +155,18 @@ public final class SitePongStructuralCapture {
         scrollOffsets.removeAll(keepingCapacity: true)
         screen = ""
         startedAt = Date()
+        lastTreeHash = 0
+        idleTicks = 0
+        failStreak = 0
+        flushBackoffUntil = nil
         sample()
     }
 
     public func setScreen(_ name: String) {
         guard running, name != screen else { return }
+        idleTicks = 0
         sample()
-        events.append(["t": now(), "type": "screen", "name": name])
+        appendEvent(["t": now(), "type": "screen", "name": name])
         screen = name
     }
 
@@ -196,6 +218,13 @@ public final class SitePongStructuralCapture {
         return nil
     }
 
+    /// djb2-fold a string into the running walk hash (same cheap hash family as
+    /// WatchtowerHash; deterministic, unlike Swift's per-process Hasher).
+    private func fold(_ s: String) {
+        for b in s.utf8 { walkHash = walkHash &* 33 &+ UInt64(b) }
+        walkHash = walkHash &* 33 &+ 0x1F // field separator
+    }
+
     private func serialize(_ v: UIView, in window: UIWindow, sensitiveRects: [CGRect]) -> [String: Any]? {
         if v.isHidden || v.alpha < 0.02 { return nil }
         let f = v.convert(v.bounds, to: window)
@@ -225,6 +254,9 @@ public final class SitePongStructuralCapture {
         var node: [String: Any] = ["id": idFor(v), "tag": tag, "attrs": attrs]
         // Never serialize text inside a sensitive region.
         if !inSensitive, let t = textFor(v), !t.isEmpty { node["text"] = t }
+        fold("\(idFor(v))|\(tag)")
+        for k in attrs.keys.sorted() { fold("\(k)=\(attrs[k] ?? "")") }
+        if let t = node["text"] as? String { fold(t) }
         // Don't descend into text/controls' internal subviews (keeps the tree clean).
         if !(v is UILabel) && !(v is UIButton) {
             var kids: [[String: Any]] = []
@@ -244,11 +276,21 @@ public final class SitePongStructuralCapture {
         scanScrolls.removeAll(keepingCapacity: true)
         let sensitiveRects = WatchtowerRegistry.shared.sensitiveRects(in: w)
         let t0 = Date()
+        walkHash = 5381
         guard let root = serialize(w, in: w, sensitiveRects: sensitiveRects) else { return }
         let walkMs = Date().timeIntervalSince(t0) * 1000
         if walkMs > walkBudgetMs { overloadSkip = min(maxOverloadSkip, Int(walkMs / walkBudgetMs)) }
 
-        events.append(["t": now(), "type": "snapshot", "tree": root])
+        // Only buffer a snapshot when the tree actually changed — the server
+        // diffs consecutive snapshots, so identical ones are pure waste (they
+        // were ~8/s of upload + battery on a static screen).
+        if walkHash != lastTreeHash {
+            lastTreeHash = walkHash
+            idleTicks = 0
+            appendEvent(["t": now(), "type": "snapshot", "tree": root])
+        } else {
+            idleTicks += 1
+        }
 
         // Scroll detection: did any scroll view's offset move? Densify sampling
         // for a few ticks so fast scrolls (captured as frame deltas) aren't aliased.
@@ -260,10 +302,30 @@ public final class SitePongStructuralCapture {
         scrollQuietTicks = scrolled ? 0 : scrollQuietTicks + 1
     }
 
-    /// Self-scheduling sampler: 60ms while scrolling, 120ms at rest.
+    /// Buffer an event, bounded: on overflow drop the oldest and advance the
+    /// flush cursor past them (the server tolerates seq gaps), then force a
+    /// keyframe so replay resumes coherently. Only trims while no batch is in
+    /// flight so the cursor arithmetic stays race-free (all on main).
+    private func appendEvent(_ e: [String: Any]) {
+        events.append(e)
+        if !sending && events.count > maxPendingEvents {
+            let excess = events.count - maxPendingEvents
+            events.removeFirst(excess)
+            flushedEventCount += excess
+            lastTreeHash = 0
+        }
+    }
+
+    /// Self-scheduling sampler: 60ms while scrolling, 120ms at rest, easing to
+    /// 0.5s after ~3s without a tree change and 1s after ~15s. Taps and screen
+    /// changes sample immediately and reset the idle backoff.
     private func scheduleSample() {
         guard running else { return }
-        let interval = scrollQuietTicks < 3 ? 0.06 : 0.12
+        let interval: Double
+        if scrollQuietTicks < 3 { interval = 0.06 }
+        else if idleTicks > 50 { interval = 1.0 }
+        else if idleTicks > 25 { interval = 0.5 }
+        else { interval = 0.12 }
         DispatchQueue.main.asyncAfter(deadline: .now() + interval) { [weak self] in
             guard let self = self, self.running else { return }
             self.sample()
@@ -275,11 +337,12 @@ public final class SitePongStructuralCapture {
         guard running, let w = keyWindow() else { return }
         let p = g.location(in: w)
         let hit = w.hitTest(p, with: nil)
+        idleTicks = 0
         sample()
         var nodeId = 0
         if let hit = hit { nodeId = idFor(deepestInteresting(hit)) }
         let bounds = w.bounds
-        events.append([
+        appendEvent([
             "t": now(), "type": "tap", "nodeId": nodeId,
             "x": Double(p.x / max(bounds.width, 1)), "y": Double(p.y / max(bounds.height, 1)),
         ])
@@ -301,12 +364,23 @@ public final class SitePongStructuralCapture {
     /// nothing is lost offline. All buffer mutation stays on the main thread.
     private func flush() {
         guard !endpoint.isEmpty, !sending, !events.isEmpty, let w = keyWindow() else { return }
+        // Cooling off after a failed retry cycle — don't hammer a sick server.
+        if let until = flushBackoffUntil, Date() < until { return }
         let batch = events
         let seqStart = flushedEventCount
         events.removeAll(keepingCapacity: true) // drain the device buffer
         sending = true
         post(batch: batch, seqStart: seqStart,
              viewport: (Int(w.bounds.width), Int(w.bounds.height)), attempt: 0)
+    }
+
+    /// A batch we will never deliver (oversized or rejected outright): advance
+    /// the cursor past it so the seq stays consistent, and force a keyframe so
+    /// the stored replay picks back up from a full snapshot.
+    private func dropBatch(seqStart: Int, count: Int) {
+        flushedEventCount = seqStart + count
+        lastTreeHash = 0
+        sending = false
     }
 
     private func requestBody(batch: [[String: Any]], seqStart: Int, sessionId: String, viewport: (Int, Int)) -> Data? {
@@ -338,22 +412,40 @@ public final class SitePongStructuralCapture {
             DispatchQueue.main.async { self.sending = false }
             return
         }
+        // A body this size will only ever 413 — retrying it grows it further
+        // (the exact runaway that took down ingest). Drop it and keyframe.
+        if body.count > maxBodyBytes {
+            DispatchQueue.main.async { self.dropBatch(seqStart: seqStart, count: batch.count) }
+            return
+        }
         URLSession.shared.dataTask(with: req) { [weak self] _, resp, err in
             guard let self = self else { return }
-            let ok = (resp as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false
+            let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let ok = (200..<300).contains(status)
+            // 4xx (except timeout/rate-limit) is permanent — the server will
+            // never accept this exact batch, so retrying is pure waste.
+            let permanent = err == nil && (400..<500).contains(status) && status != 408 && status != 429
             DispatchQueue.main.async {
                 if ok && err == nil {
                     self.flushedEventCount = seqStart + batch.count
+                    self.failStreak = 0
+                    self.flushBackoffUntil = nil
                     self.sending = false
+                } else if permanent {
+                    self.dropBatch(seqStart: seqStart, count: batch.count)
                 } else if attempt < 3 {
                     let delay = pow(2.0, Double(attempt)) // 1,2,4s
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                         self.post(batch: batch, seqStart: seqStart, viewport: viewport, attempt: attempt + 1)
                     }
                 } else {
-                    // Give up on this attempt: re-queue at the front so the seq
-                    // stays contiguous and the delta re-sends on the next flush.
+                    // Give up on this cycle: re-queue at the front so the seq
+                    // stays contiguous and the delta re-sends after a cooldown
+                    // that doubles per consecutive failure (8s … 2min).
                     self.events.insert(contentsOf: batch, at: 0)
+                    self.failStreak += 1
+                    let cooldown = min(120.0, 8.0 * pow(2.0, Double(self.failStreak - 1)))
+                    self.flushBackoffUntil = Date().addingTimeInterval(cooldown)
                     self.sending = false
                 }
             }
