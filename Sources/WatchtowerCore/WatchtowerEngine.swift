@@ -406,9 +406,26 @@ final class WatchtowerEngine {
 
     // MARK: - Screen identity (§3.2)
 
+    /// UIKit's private and input-accessory controllers appear like screens
+    /// (keyboard cursor accessory, text-tracking windows, editing overlays…)
+    /// but never represent one; letting them through names the user's screen
+    /// "_UICursorAccessoryViewController". Match by class name — private.
+    static func isInternalController(_ vc: UIViewController) -> Bool {
+        let cls = String(describing: type(of: vc))
+        if cls.hasPrefix("_") { return true }
+        let internalMarkers = [
+            "InputWindowController", "CompatibilityInputViewController",
+            "TrackingElementWindowController", "EditingOverlayViewController",
+            "SystemInputAssistant", "PredictionViewController", "Keyboard",
+            "InputSetHostViewController", "UISystemKeyboard", "RemoteInputViewController",
+        ]
+        return internalMarkers.contains { cls.contains($0) }
+    }
+
     func didAppear(viewController vc: UIViewController) {
         // Skip container controllers that don't represent a screen.
         if vc is UINavigationController || vc is UITabBarController { return }
+        if Self.isInternalController(vc) { return }
         // SwiftUI hosting controllers get their identity from the
         // `.watchtowerScreen` modifier inside, not the generic class name; don't
         // let them clobber the auto screen name.
@@ -504,6 +521,13 @@ final class WatchtowerEngine {
         event.viewport_w = UInt(bounds.width)
         event.viewport_h = UInt(bounds.height)
         event.frame_hash = captureSessionFrames ? lastFrameHash : nil
+        if resolved.role == "webview" {
+            // The tap is answered inside the web content (a game, a checkout
+            // page): the native dead heuristic cannot observe it, so never
+            // stamp `dead`. Ingest likewise skips rage for this role.
+            emit(event)
+            return
+        }
         stageForDeadCheck(event, screenName: screenName)
     }
 
@@ -572,6 +596,11 @@ final class WatchtowerEngine {
     /// Hit-test → resolve deepest interactive view → element identity (§3.3).
     private func resolveElement(at point: CGPoint, in window: UIWindow) -> Resolved {
         let hit = window.hitTest(point, with: nil)
+        if let web = Self.enclosingWebView(from: hit) {
+            let label = web.accessibilityLabel.flatMap { $0.isEmpty ? nil : $0 }
+            let id = web.accessibilityIdentifier.flatMap { $0.isEmpty ? nil : $0 } ?? label ?? "webview"
+            return Resolved(id: id, label: label, role: "webview")
+        }
         let view = deepestInteractive(from: hit) ?? hit
 
         // SwiftUI tag region takes precedence for id if the hit view itself
@@ -609,6 +638,31 @@ final class WatchtowerEngine {
     }
 
 
+
+    /// The WKWebView (or RN's RNCWebView wrapper) containing `view`, if any.
+    /// Web views host their own UI tree; the outermost labelled wrapper is
+    /// the meaningful element ("Purple Sector game view"), not the WKContentView
+    /// the hit test lands on.
+    static func enclosingWebView(from view: UIView?) -> UIView? {
+        var v = view
+        var found: UIView? = nil
+        while let cur = v {
+            let cls = String(describing: type(of: cur))
+            if cls.contains("WKWebView") || cls.contains("RNCWebView") || cls.contains("WKContentView") {
+                found = cur
+            }
+            v = cur.superview
+        }
+        guard let web = found else { return nil }
+        // Prefer the closest ancestor (including the web view) that carries a label.
+        var w: UIView? = web
+        while let cur = w {
+            if let al = cur.accessibilityLabel, !al.isEmpty { return cur }
+            if let ai = cur.accessibilityIdentifier, !ai.isEmpty { return cur }
+            w = cur.superview
+        }
+        return web
+    }
 
     private func deepestInteractive(from view: UIView?) -> UIView? {
         var v = view
